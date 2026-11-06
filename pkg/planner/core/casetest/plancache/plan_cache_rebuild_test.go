@@ -27,8 +27,11 @@ import (
 
 	"github.com/bazelbuild/rules_go/go/runfiles"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/pkg/executor"
 	"github.com/pingcap/tidb/pkg/expression"
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/parser"
+	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/planner"
 	"github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/planner/core/base"
@@ -36,8 +39,13 @@ import (
 	"github.com/pingcap/tidb/pkg/planner/core/resolve"
 	"github.com/pingcap/tidb/pkg/planner/util"
 	"github.com/pingcap/tidb/pkg/planner/util/coretestsdk"
+	"github.com/pingcap/tidb/pkg/store/helper"
+	"github.com/pingcap/tidb/pkg/store/mockstore"
+	"github.com/pingcap/tidb/pkg/tablecodec"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/stretchr/testify/require"
+	"github.com/tikv/client-go/v2/testutils"
+	"github.com/tikv/client-go/v2/tikv"
 )
 
 func TestPlanCacheClone(t *testing.T) {
@@ -576,4 +584,55 @@ func BenchmarkPointGetClone(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		src.CloneForPlanCache(sctx)
 	}
+}
+
+func TestPreparedPlanCacheRefreshesSplitRegionBeforeExecution(t *testing.T) {
+	ctx := context.Background()
+	var cluster testutils.Cluster
+	store, dom := testkit.CreateMockStoreAndDomain(t, mockstore.WithClusterInspector(func(c testutils.Cluster) {
+		mockstore.BootstrapWithSingleStore(c)
+		cluster = c
+	}))
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set tidb_enable_prepared_plan_cache = 1")
+	tk.MustExec("create table t (id bigint primary key clustered)")
+	tk.MustExec("insert into t values (1), (100)")
+	tk.MustExec("prepare s from 'select id from t where id = ?'")
+	tk.MustExec("set @warm = 1, @hit = 100")
+	tk.MustQuery("execute s using @warm").Check(testkit.Rows("1"))
+	tk.MustQuery("select @@last_plan_from_cache").Check(testkit.Rows("0"))
+
+	tbl, err := dom.InfoSchema().TableByName(ctx, ast.NewCIStr("test"), ast.NewCIStr("t"))
+	require.NoError(t, err)
+	warmKey := tablecodec.EncodeRowKeyWithHandle(tbl.Meta().ID, kv.IntHandle(1))
+	hitKey := tablecodec.EncodeRowKeyWithHandle(tbl.Meta().ID, kv.IntHandle(100))
+	cache := store.(helper.Storage).GetRegionCache()
+	parent := cache.TryLocateKey(warmKey)
+	require.NotNil(t, parent)
+	require.True(t, parent.Contains(hitKey))
+	peer := cluster.AllocID()
+	right := cluster.SplitRaw(parent.Region.GetID(), cluster.AllocID(), store.GetCodec().EncodeKey(hitKey), []uint64{peer}, peer)
+	stale := cache.TryLocateKey(hitKey)
+	require.NotNil(t, stale)
+	require.Equal(t, parent.Region, stale.Region)
+
+	// Compile EXECUTE through the normal planner, but hold execution until
+	// after inspecting the cache: no read or region-error retry can repair it.
+	stmt, err := parser.New().ParseOneStmt("execute s using @hit", "", "")
+	require.NoError(t, err)
+	require.NoError(t, tk.Session().PrepareTxnCtx(ctx, stmt))
+	compiler := executor.Compiler{Ctx: tk.Session()}
+	compiled, err := compiler.Compile(ctx, stmt)
+	require.NoError(t, err)
+	require.True(t, tk.Session().GetSessionVars().FoundInPlanCache)
+	route := cache.TryLocateKey(hitKey)
+	require.NotNil(t, route)
+	want := tikv.NewRegionVerID(right.Id, right.RegionEpoch.ConfVer, right.RegionEpoch.Version)
+	require.Equal(t, want, route.Region, "cache hit must route the rebound key to the split child before execution")
+	require.Equal(t, []byte(hitKey), route.StartKey)
+
+	rs, err := compiled.Exec(ctx)
+	require.NoError(t, err)
+	tk.ResultSetToResult(rs, "execute s using @hit").Check(testkit.Rows("100"))
 }
