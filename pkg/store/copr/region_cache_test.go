@@ -537,3 +537,33 @@ func TestOverlappingRangesCanProduceOutOfOrderRangesAfterSplit(t *testing.T) {
 	require.Len(t, result, 1)
 	require.Equal(t, lkr, result[0])
 }
+
+func TestRefreshRegionEpochsAfterSplit(t *testing.T) {
+	ctx := context.Background()
+	client, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, client.Close()) }()
+	_, ids, _ := testutils.BootstrapWithMultiRegions(cluster, []byte("z"))
+	pd := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pd.Close()
+	cache := NewRegionCache(tikv.NewRegionCache(pd))
+	defer cache.Close()
+
+	bo := tikv.NewBackofferWithVars(ctx, 3000, nil)
+	old, err := cache.LocateKey(bo, []byte("h"))
+	require.NoError(t, err)
+	rightID, peer := cluster.AllocID(), cluster.AllocID()
+	cluster.Split(ids[0], rightID, []byte("m"), []uint64{peer}, peer)
+	require.Equal(t, old.Region, cache.TryLocateKey([]byte("m")).Region)
+
+	// Inspect the shared cache before a TiKV request or retry can repair it.
+	err = cache.RefreshRegionEpochs(ctx, []kv.KeyRange{{StartKey: []byte("h"), EndKey: []byte("t")}})
+	require.NoError(t, err)
+	left, right := cache.TryLocateKey([]byte("h")), cache.TryLocateKey([]byte("m"))
+	require.NotNil(t, left)
+	require.NotNil(t, right)
+	require.Greater(t, left.Region.GetVer(), old.Region.GetVer())
+	require.Equal(t, []byte("m"), left.EndKey)
+	require.Equal(t, rightID, right.Region.GetID())
+	require.Equal(t, []byte("m"), right.StartKey)
+}

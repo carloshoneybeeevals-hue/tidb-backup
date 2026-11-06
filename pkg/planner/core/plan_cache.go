@@ -21,9 +21,11 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/bindinfo"
+	"github.com/pingcap/tidb/pkg/distsql"
 	"github.com/pingcap/tidb/pkg/domain"
 	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/infoschema"
+	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/metrics"
 	"github.com/pingcap/tidb/pkg/parser/ast"
@@ -35,6 +37,8 @@ import (
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/sessiontxn/staleread"
+	"github.com/pingcap/tidb/pkg/store/copr"
+	"github.com/pingcap/tidb/pkg/tablecodec"
 	"github.com/pingcap/tidb/pkg/types"
 	driver "github.com/pingcap/tidb/pkg/types/parser_driver"
 	"github.com/pingcap/tidb/pkg/util/chunk"
@@ -43,6 +47,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/hint"
 	"github.com/pingcap/tidb/pkg/util/intest"
 	"github.com/pingcap/tidb/pkg/util/logutil"
+	"github.com/pingcap/tidb/pkg/util/ranger"
 	"go.uber.org/zap"
 )
 
@@ -341,6 +346,9 @@ func adjustCachedPlan(ctx context.Context, sctx sessionctx.Context,
 	if !RebuildPlan4CachedPlan(plan) {
 		return nil, false, nil
 	}
+	if err := refreshCachedPlanRegions(ctx, sctx, plan, stmt); err != nil {
+		return nil, false, err
+	}
 	sessVars.FoundInPlanCache = true
 	if len(bindSQL) > 0 { // We're using binding, set this to true.
 		sessVars.FoundInBinding = true
@@ -353,6 +361,62 @@ func adjustCachedPlan(ctx context.Context, sctx sessionctx.Context,
 	stmtCtx.SetPlanDigest(stmt.NormalizedPlan, stmt.PlanDigest)
 	stmtCtx.StmtHints = *stmtHints
 	return plan, true, nil
+}
+
+// refreshCachedPlanRegions runs after parameter-dependent ranges have been rebuilt.
+func refreshCachedPlanRegions(ctx context.Context, sctx sessionctx.Context, plan base.Plan, stmt *PlanCacheStmt) error {
+	cache := copr.RegionCacheForPlanRefresh(sctx.GetStore())
+	if cache == nil || len(stmt.tbls) == 0 {
+		return nil
+	}
+	if len(stmt.tbls) == 1 && stmt.tbls[0].Meta().GetPartitionInfo() == nil {
+		id := stmt.tbls[0].Meta().ID
+		switch p := plan.(type) {
+		case *physicalop.PointGetPlan:
+			if p.TblInfo.ID == id && p.IndexInfo == nil && p.Handle != nil {
+				key := tablecodec.EncodeRowKeyWithHandle(id, p.Handle)
+				return cache.RefreshRegionEpochs(ctx, []kv.KeyRange{{StartKey: key, EndKey: key.Next()}})
+			}
+		case *physicalop.PhysicalIndexReader:
+			if scan, ok := p.IndexPlan.(*physicalop.PhysicalIndexScan); ok && scan.Table.ID == id {
+				encoded, err := distsql.IndexRangesToKVRanges(sctx.GetDistSQLCtx(), id, scan.Index.ID, scan.Ranges)
+				if err != nil {
+					return err
+				}
+				return cache.RefreshRegionEpochs(ctx, encoded.FirstPartitionRange())
+			}
+		case *physicalop.PhysicalTableReader:
+			if scan, ok := p.TablePlan.(*physicalop.PhysicalTableScan); ok && scan.Table.ID == id {
+				first, second := distsql.SplitRangesAcrossInt64Boundary(scan.Ranges, true, false, scan.Table.IsCommonHandle)
+				var ranges []kv.KeyRange
+				for _, group := range [][]*ranger.Range{first, second} {
+					encoded, err := distsql.TableHandleRangesToKVRanges(sctx.GetDistSQLCtx(), []int64{id}, scan.Table.IsCommonHandle, group)
+					if err != nil {
+						return err
+					}
+					ranges = encoded.AppendSelfTo(ranges)
+				}
+				return cache.RefreshRegionEpochs(ctx, ranges)
+			}
+		}
+	}
+	// Partition pruning, index lookups and join probes can produce keys only
+	// during execution. Include the table prefix for global indexes as well.
+	var ranges []kv.KeyRange
+	addTable := func(id int64) {
+		start := tablecodec.GenTablePrefix(id)
+		ranges = append(ranges, kv.KeyRange{StartKey: start, EndKey: start.PrefixNext()})
+	}
+	for _, tbl := range stmt.tbls {
+		meta := tbl.Meta()
+		addTable(meta.ID)
+		if pi := meta.GetPartitionInfo(); pi != nil {
+			for _, part := range pi.Definitions {
+				addTable(part.ID)
+			}
+		}
+	}
+	return cache.RefreshRegionEpochs(ctx, ranges)
 }
 
 // generateNewPlan call the optimizer to generate a new plan for current statement
