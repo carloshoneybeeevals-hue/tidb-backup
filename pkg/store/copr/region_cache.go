@@ -513,59 +513,41 @@ func RegionCacheForPlanRefresh(store kv.Storage) *RegionCache {
 	return NewRegionCache(cache)
 }
 
-// RefreshRegionEpochs verifies the routes covering ranges against PD before a
-// cached plan is reused. Cache fills may read a PD follower, so verify the
-// installed route as well as the metadata returned by the fill.
+// RefreshRegionEpochs verifies cached routes with the PD leader before plan reuse.
 func (c *RegionCache) RefreshRegionEpochs(ctx context.Context, ranges []kv.KeyRange) error {
 	const pageSize = 128
 	bo := tikv.NewBackofferWithVars(ctx, 5000, nil)
-rangeLoop:
 	for _, r := range ranges {
 		for key := []byte(r.StartKey); len(r.EndKey) == 0 || bytes.Compare(key, r.EndKey) < 0; {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			// Ask PD without allowing follower reads. ScanRegions also works
-			// with PD versions predating BatchScanRegions.
-			//nolint:staticcheck
-			page, err := c.PDClient().ScanRegions(ctx, key, r.EndKey, pageSize)
+			loc, err := c.LocateKey(bo, key)
 			if err != nil {
 				return err
 			}
-			if len(page) == 0 {
-				return errors.New("PD returned no regions for cached plan range")
+			// This lookup bypasses the cache and uses client-go's PD metadata
+			// circuit breaker. A split can retain the ID on either child, and
+			// a merge can remove the ID entirely.
+			current, err := c.LocateRegionByIDFromPD(bo, loc.Region.GetID())
+			if err != nil || current.Region != loc.Region || !current.Contains(key) {
+				// Reload by key so we discover the new owner. A cache fill may
+				// use a PD follower, so check the installed epoch on the next pass.
+				if _, fillErr := c.BatchLoadRegionsWithKeyRange(bo, key, r.EndKey, pageSize); fillErr != nil {
+					return fillErr
+				}
+				if err == nil {
+					err = errors.New("region epoch changed during cached plan refresh")
+				}
+				if err := bo.Backoff(tikv.BoRegionMiss(), err); err != nil {
+					return err
+				}
+				continue
 			}
-			for _, region := range page {
-				if region == nil || region.Meta == nil || region.Meta.RegionEpoch == nil {
-					return errors.New("PD returned incomplete region metadata for cached plan")
-				}
-				meta := region.Meta
-				end := meta.GetEndKey()
-				if bytes.Compare(meta.GetStartKey(), key) > 0 || (len(end) > 0 && bytes.Compare(end, key) <= 0) {
-					return errors.New("PD region does not cover cached plan range")
-				}
-				matches := func(loc *tikv.KeyLocation) bool {
-					return loc != nil && loc.Region.GetID() == meta.Id &&
-						loc.Region.GetVer() == meta.RegionEpoch.Version && loc.Region.GetConfVer() == meta.RegionEpoch.ConfVer
-				}
-				if !matches(c.TryLocateKey(key)) {
-					if _, err := c.BatchLoadRegionsWithKeyRange(bo, key, r.EndKey, pageSize); err != nil {
-						return err
-					}
-					if !matches(c.TryLocateKey(key)) {
-						// A lagging follower or concurrent split can change the
-						// answer. Recheck this key against PD with bounded backoff.
-						if err := bo.Backoff(tikv.BoRegionMiss(), errors.New("region epoch changed during cached plan refresh")); err != nil {
-							return err
-						}
-						break
-					}
-				}
-				if len(end) == 0 || (len(r.EndKey) > 0 && bytes.Compare(end, r.EndKey) >= 0) {
-					continue rangeLoop
-				}
-				key = end
+			if len(current.EndKey) == 0 {
+				break
 			}
+			key = current.EndKey
 		}
 	}
 	return nil
