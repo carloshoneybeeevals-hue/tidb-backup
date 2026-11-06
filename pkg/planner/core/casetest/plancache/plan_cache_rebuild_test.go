@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/bazelbuild/rules_go/go/runfiles"
@@ -47,6 +48,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/client-go/v2/testutils"
 	"github.com/tikv/client-go/v2/tikv"
+	"github.com/tikv/client-go/v2/tikvrpc"
 	pd "github.com/tikv/pd/client"
 	"github.com/tikv/pd/client/clients/router"
 	"github.com/tikv/pd/client/opt"
@@ -694,14 +696,17 @@ func (p *planCacheProbePD) GetRegionByID(ctx context.Context, id uint64, opts ..
 	return p.Client.GetRegionByID(ctx, id, opts...)
 }
 
+func (p *planCacheProbePD) hijack(c pd.Client) pd.Client {
+	codec := c.(*tikv.CodecPDClient)
+	p.Client = codec.Client
+	codec.Client = p
+	return codec
+}
+
 func TestPreparedPlanCacheRegionProbeIsBestEffort(t *testing.T) {
-	var probe *planCacheProbePD
-	store := testkit.CreateMockStore(t, mockstore.WithPDClientHijacker(func(c pd.Client) pd.Client {
-		codec := c.(*tikv.CodecPDClient)
-		probe = &planCacheProbePD{Client: codec.Client}
-		codec.Client = probe
-		return codec
-	}))
+	t.Run("SplitWithinVerificationWindow", testSplitWithinVerificationWindow)
+	probe := &planCacheProbePD{}
+	store := testkit.CreateMockStore(t, mockstore.WithPDClientHijacker(probe.hijack))
 	tk := testkit.NewTestKit(t, store)
 	tk.MustExec("use test")
 	tk.MustExec("create table t (id bigint primary key clustered)")
@@ -737,4 +742,89 @@ func TestPreparedPlanCacheRegionProbeIsBestEffort(t *testing.T) {
 	require.Equal(t, before+1, probe.calls.Load())
 	hit(other)
 	require.Equal(t, before+1, probe.calls.Load(), "PD failure should not trigger a probe on every hit")
+}
+
+type planCacheGetTraceKey struct{}
+
+type planCacheGetAttempt struct {
+	region        tikv.RegionVerID
+	epochMismatch bool
+	succeeded     bool
+}
+
+type planCacheGetClient struct{ tikv.Client }
+
+func (c planCacheGetClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (*tikvrpc.Response, error) {
+	attempts, _ := ctx.Value(planCacheGetTraceKey{}).(*[]planCacheGetAttempt)
+	if attempts == nil || req.Type != tikvrpc.CmdGet {
+		return c.Client.SendRequest(ctx, addr, req, timeout)
+	}
+	region := tikv.NewRegionVerID(req.RegionId, req.RegionEpoch.GetConfVer(), req.RegionEpoch.GetVersion())
+	resp, err := c.Client.SendRequest(ctx, addr, req, timeout)
+	attempt := planCacheGetAttempt{region: region}
+	if err == nil && resp != nil {
+		regionErr, decodeErr := resp.GetRegionError()
+		attempt.epochMismatch = regionErr.GetEpochNotMatch() != nil
+		attempt.succeeded = decodeErr == nil && regionErr == nil
+	}
+	*attempts = append(*attempts, attempt)
+	return resp, err
+}
+
+func testSplitWithinVerificationWindow(t *testing.T) {
+	var cluster testutils.Cluster
+	probe := &planCacheProbePD{}
+	store, dom := testkit.CreateMockStoreAndDomain(t,
+		mockstore.WithClusterInspector(func(c testutils.Cluster) {
+			mockstore.BootstrapWithSingleStore(c)
+			cluster = c
+		}),
+		mockstore.WithPDClientHijacker(probe.hijack),
+		mockstore.WithClientHijacker(func(c tikv.Client) tikv.Client { return planCacheGetClient{c} }),
+	)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set tidb_enable_prepared_plan_cache = 1")
+	tk.MustExec("create table t (id bigint primary key clustered, v int)")
+	tk.MustExec("insert into t values (1, 10), (100, 20)")
+	tk.MustExec("prepare s from 'select v from t where id = ?'")
+	tk.MustExec("set @warm = 1, @hit = 100")
+	tk.MustQuery("execute s using @warm").Check(testkit.Rows("10"))
+	tk.MustQuery("select @@last_plan_from_cache").Check(testkit.Rows("0"))
+
+	ctx := context.Background()
+	tbl, err := dom.InfoSchema().TableByName(ctx, ast.NewCIStr("test"), ast.NewCIStr("t"))
+	require.NoError(t, err)
+	key := tablecodec.EncodeRowKeyWithHandle(tbl.Meta().ID, kv.IntHandle(100))
+	parent := store.(helper.Storage).GetRegionCache().TryLocateKey(key)
+	require.NotNil(t, parent)
+	require.True(t, parent.Contains(tablecodec.EncodeRowKeyWithHandle(tbl.Meta().ID, kv.IntHandle(1))))
+	peer := cluster.AllocID()
+	var attempts []planCacheGetAttempt
+	traceCtx := context.WithValue(ctx, planCacheGetTraceKey{}, &attempts)
+	const hitSQL = "execute s using @hit"
+	stmt, err := parser.New().ParseOneStmt(hitSQL, "", "")
+	require.NoError(t, err)
+
+	// Verify the parent on a real cache hit immediately before the split.
+	before := probe.calls.Load()
+	tk.MustQuery("execute s using @warm").Check(testkit.Rows("10"))
+	require.True(t, tk.Session().GetSessionVars().FoundInPlanCache)
+	verified := probe.calls.Load()
+	require.Greater(t, verified, before)
+	child := cluster.SplitRaw(parent.Region.GetID(), cluster.AllocID(), store.GetCodec().EncodeKey(key), []uint64{peer}, peer)
+	require.NoError(t, tk.Session().PrepareTxnCtx(traceCtx, stmt))
+	compiler := executor.Compiler{Ctx: tk.Session()}
+	compiled, err := compiler.Compile(traceCtx, stmt)
+	require.NoError(t, err)
+	require.True(t, tk.Session().GetSessionVars().FoundInPlanCache)
+	require.Equal(t, verified, probe.calls.Load(), "the hit inside the window must reuse the verified route")
+
+	rs, err := compiled.Exec(traceCtx)
+	require.NoError(t, err)
+	tk.ResultSetToResultWithCtx(traceCtx, rs, hitSQL).Check(testkit.Rows("20"))
+	require.GreaterOrEqual(t, len(attempts), 2)
+	require.Equal(t, planCacheGetAttempt{region: parent.Region, epochMismatch: true}, attempts[0])
+	childRegion := tikv.NewRegionVerID(child.Id, child.RegionEpoch.ConfVer, child.RegionEpoch.Version)
+	require.Equal(t, planCacheGetAttempt{region: childRegion, succeeded: true}, attempts[len(attempts)-1])
 }
