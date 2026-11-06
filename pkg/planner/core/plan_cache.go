@@ -363,11 +363,22 @@ func adjustCachedPlan(ctx context.Context, sctx sessionctx.Context,
 	return plan, true, nil
 }
 
+type planCacheRegionRefreshKey struct{}
+
+func (planCacheRegionRefreshKey) String() string { return "plan-cache-region-refresh" }
+
 // refreshCachedPlanRegions runs after parameter-dependent ranges have been rebuilt.
 func refreshCachedPlanRegions(ctx context.Context, sctx sessionctx.Context, plan base.Plan, stmt *PlanCacheStmt) error {
-	cache := copr.RegionCacheForPlanRefresh(sctx.GetStore())
-	if cache == nil || len(stmt.tbls) == 0 {
+	if len(stmt.tbls) == 0 {
 		return nil
+	}
+	cache, _ := sctx.Value(planCacheRegionRefreshKey{}).(*copr.PlanCacheRegionRefresher)
+	if cache == nil {
+		cache = copr.RegionCacheForPlanRefresh(sctx.GetStore())
+		if cache == nil {
+			return nil
+		}
+		sctx.SetValue(planCacheRegionRefreshKey{}, cache)
 	}
 	if len(stmt.tbls) == 1 && stmt.tbls[0].Meta().GetPartitionInfo() == nil {
 		id := stmt.tbls[0].Meta().ID

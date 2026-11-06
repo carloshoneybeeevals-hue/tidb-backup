@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"unsafe"
 
@@ -46,6 +47,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/client-go/v2/testutils"
 	"github.com/tikv/client-go/v2/tikv"
+	pd "github.com/tikv/pd/client"
+	"github.com/tikv/pd/client/clients/router"
+	"github.com/tikv/pd/client/opt"
+	"github.com/tikv/pd/client/pkg/caller"
 )
 
 func TestPlanCacheClone(t *testing.T) {
@@ -635,4 +640,65 @@ func TestPreparedPlanCacheRefreshesSplitRegionBeforeExecution(t *testing.T) {
 	rs, err := compiled.Exec(ctx)
 	require.NoError(t, err)
 	tk.ResultSetToResult(rs, "execute s using @hit").Check(testkit.Rows("100"))
+}
+
+type planCacheProbePD struct {
+	pd.Client
+	calls atomic.Int64
+	fail  atomic.Bool
+}
+
+func (p *planCacheProbePD) WithCallerComponent(caller.Component) pd.Client { return p }
+
+func (p *planCacheProbePD) GetRegionByID(ctx context.Context, id uint64, opts ...opt.GetRegionOption) (*router.Region, error) {
+	p.calls.Add(1)
+	if p.fail.Load() {
+		return nil, errors.New("injected PD region lookup failure")
+	}
+	return p.Client.GetRegionByID(ctx, id, opts...)
+}
+
+func TestPreparedPlanCacheRegionProbeIsBestEffort(t *testing.T) {
+	var probe *planCacheProbePD
+	store := testkit.CreateMockStore(t, mockstore.WithPDClientHijacker(func(c pd.Client) pd.Client {
+		codec := c.(*tikv.CodecPDClient)
+		probe = &planCacheProbePD{Client: codec.Client}
+		codec.Client = probe
+		return codec
+	}))
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t (id bigint primary key clustered)")
+	tk.MustExec("insert into t values (1)")
+	warm := func(tk *testkit.TestKit) {
+		tk.MustExec("use test")
+		tk.MustExec("set tidb_enable_prepared_plan_cache = 1")
+		tk.MustExec("prepare s from 'select id from t where id = ?'")
+		tk.MustExec("set @id = 1")
+		tk.MustQuery("execute s using @id").Check(testkit.Rows("1"))
+		tk.MustQuery("select @@last_plan_from_cache").Check(testkit.Rows("0"))
+	}
+	hit := func(tk *testkit.TestKit) {
+		tk.MustQuery("execute s using @id").Check(testkit.Rows("1"))
+		tk.MustQuery("select @@last_plan_from_cache").Check(testkit.Rows("1"))
+	}
+
+	warm(tk)
+	before := probe.calls.Load()
+	hit(tk)
+	verified := probe.calls.Load()
+	require.Greater(t, verified, before)
+	probe.fail.Store(true)
+	hit(tk)
+	require.Equal(t, verified, probe.calls.Load(), "a recently verified route should stay local")
+
+	// A new session has no verification history. Its first probe fails,
+	// but the cached route still serves the query and the next hit backs off.
+	other := testkit.NewTestKit(t, store)
+	warm(other)
+	before = probe.calls.Load()
+	hit(other)
+	require.Equal(t, before+1, probe.calls.Load())
+	hit(other)
+	require.Equal(t, before+1, probe.calls.Load(), "PD failure should not trigger a probe on every hit")
 }

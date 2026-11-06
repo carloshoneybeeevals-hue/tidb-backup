@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
@@ -500,8 +502,18 @@ func NewRegionCache(rc *tikv.RegionCache) *RegionCache {
 	return &RegionCache{rc}
 }
 
-// RegionCacheForPlanRefresh returns the routing cache used by the TiKV storage.
-func RegionCacheForPlanRefresh(store kv.Storage) *RegionCache {
+// PlanCacheRegionRefresher belongs to one SQL session. Keep a bounded set
+// of recently verified epochs, independent of the shared physical plan.
+type PlanCacheRegionRefresher struct {
+	cache      *tikv.RegionCache
+	mu         sync.Mutex
+	recent     map[tikv.RegionVerID]struct{}
+	windowEnd  time.Time
+	retryAfter time.Time
+}
+
+// RegionCacheForPlanRefresh returns a verifier for the routing cache used by TiKV storage.
+func RegionCacheForPlanRefresh(store kv.Storage) *PlanCacheRegionRefresher {
 	provider, ok := store.(interface{ GetRegionCache() *tikv.RegionCache })
 	if !ok {
 		return nil
@@ -510,44 +522,88 @@ func RegionCacheForPlanRefresh(store kv.Storage) *RegionCache {
 	if cache == nil {
 		return nil
 	}
-	return NewRegionCache(cache)
+	return &PlanCacheRegionRefresher{cache: cache}
 }
 
-// RefreshRegionEpochs verifies cached routes with the PD leader before plan reuse.
-func (c *RegionCache) RefreshRegionEpochs(ctx context.Context, ranges []kv.KeyRange) error {
-	const pageSize = 128
-	bo := tikv.NewBackofferWithVars(ctx, 5000, nil)
+// RefreshRegionEpochs opportunistically checks existing routes. Normal KV
+// lookup and region-error handling remain responsible for execution.
+func (v *PlanCacheRegionRefresher) RefreshRegionEpochs(ctx context.Context, ranges []kv.KeyRange) error {
+	const checkInterval = time.Second
+	const maxVerifiedRegions = 64
+	if !v.mu.TryLock() {
+		return ctx.Err()
+	}
+	defer v.mu.Unlock()
+	now := time.Now()
+	if now.Before(v.retryAfter) {
+		return ctx.Err()
+	}
+	if !now.Before(v.windowEnd) {
+		clear(v.recent)
+		v.windowEnd = now.Add(checkInterval)
+	}
+	var bo *tikv.Backoffer
 	for _, r := range ranges {
 		for key := []byte(r.StartKey); len(r.EndKey) == 0 || bytes.Compare(key, r.EndKey) < 0; {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			loc, err := c.LocateKey(bo, key)
-			if err != nil {
-				return err
-			}
-			// This lookup bypasses the cache and uses client-go's PD metadata
-			// circuit breaker. A split can retain the ID on either child, and
-			// a merge can remove the ID entirely.
-			current, err := c.LocateRegionByIDFromPD(bo, loc.Region.GetID())
-			if err != nil || current.Region != loc.Region || !current.Contains(key) {
-				// Reload by key so we discover the new owner. A cache fill may
-				// use a PD follower, so check the installed epoch on the next pass.
-				if _, fillErr := c.BatchLoadRegionsWithKeyRange(bo, key, r.EndKey, pageSize); fillErr != nil {
-					return fillErr
-				}
-				if err == nil {
-					err = errors.New("region epoch changed during cached plan refresh")
-				}
-				if err := bo.Backoff(tikv.BoRegionMiss(), err); err != nil {
-					return err
-				}
-				continue
-			}
-			if len(current.EndKey) == 0 {
+			loc := v.cache.TryLocateKey(key)
+			if loc == nil {
+				// A cache miss already forces execution to locate the key.
 				break
 			}
-			key = current.EndKey
+			if _, checked := v.recent[loc.Region]; !checked {
+				// Leave the rest to execution once this session's sampling
+				// budget is spent, including large table/partition ranges.
+				if len(v.recent) >= maxVerifiedRegions {
+					return ctx.Err()
+				}
+				if bo == nil {
+					// Bound the entire optional check and avoid PD retries on
+					// the query's critical path. Hot point gets need no timer.
+					probeCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+					defer cancel()
+					bo = tikv.NewNoopBackoff(probeCtx)
+				}
+				loc = v.verifyRoute(bo, loc, key, r.EndKey)
+				if loc == nil {
+					v.retryAfter = time.Now().Add(checkInterval)
+					return ctx.Err()
+				}
+				if v.recent == nil {
+					v.recent = make(map[tikv.RegionVerID]struct{})
+				}
+				v.recent[loc.Region] = struct{}{}
+			}
+			if len(loc.EndKey) == 0 {
+				break
+			}
+			key = loc.EndKey
+		}
+	}
+	return ctx.Err()
+}
+
+// verifyRoute checks the cached ID with PD. On a mismatch, refill by key
+// and verify the installed owner once, since the refill can use a follower.
+func (v *PlanCacheRegionRefresher) verifyRoute(bo *tikv.Backoffer, loc *tikv.KeyLocation, key, end []byte) *tikv.KeyLocation {
+	for attempt := 0; attempt < 2; attempt++ {
+		current, err := v.cache.LocateRegionByIDFromPD(bo, loc.Region.GetID())
+		if err != nil {
+			return nil
+		}
+		if current.Region == loc.Region && current.Contains(key) {
+			return current
+		}
+		if attempt == 0 {
+			if _, err := v.cache.BatchLoadRegionsWithKeyRange(bo, key, end, 128); err != nil {
+				return nil
+			}
+			loc = v.cache.TryLocateKey(key)
+			if loc == nil {
+				return nil
+			}
 		}
 	}
 	return nil

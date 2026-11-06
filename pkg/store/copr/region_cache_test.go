@@ -17,6 +17,7 @@ package copr
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/kvproto/pkg/metapb"
@@ -557,7 +558,8 @@ func TestRefreshRegionEpochsAfterSplit(t *testing.T) {
 	require.Equal(t, old.Region, cache.TryLocateKey([]byte("m")).Region)
 
 	// Inspect the shared cache before a TiKV request or retry can repair it.
-	err = cache.RefreshRegionEpochs(ctx, []kv.KeyRange{{StartKey: []byte("h"), EndKey: []byte("t")}})
+	refresh := PlanCacheRegionRefresher{cache: cache.RegionCache}
+	err = refresh.RefreshRegionEpochs(ctx, []kv.KeyRange{{StartKey: []byte("h"), EndKey: []byte("t")}})
 	require.NoError(t, err)
 	left, right := cache.TryLocateKey([]byte("h")), cache.TryLocateKey([]byte("m"))
 	require.NotNil(t, left)
@@ -566,4 +568,20 @@ func TestRefreshRegionEpochsAfterSplit(t *testing.T) {
 	require.Equal(t, []byte("m"), left.EndKey)
 	require.Equal(t, rightID, right.Region.GetID())
 	require.Equal(t, []byte("m"), right.StartKey)
+
+	// A split that the local cache hasn't observed can stay hidden within
+	// the sampling window. Move the window explicitly so this needs no sleep.
+	refresh.windowEnd = time.Now().Add(time.Hour)
+	newID, peer := cluster.AllocID(), cluster.AllocID()
+	cluster.Split(rightID, newID, []byte("p"), []uint64{peer}, peer)
+	point := []kv.KeyRange{{StartKey: []byte("p"), EndKey: []byte("q")}}
+	require.NoError(t, refresh.RefreshRegionEpochs(ctx, point))
+	require.Equal(t, right.Region, cache.TryLocateKey([]byte("p")).Region)
+	refresh.windowEnd = time.Time{}
+	require.NoError(t, refresh.RefreshRegionEpochs(ctx, point))
+	require.Equal(t, newID, cache.TryLocateKey([]byte("p")).Region.GetID())
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	require.ErrorIs(t, refresh.RefreshRegionEpochs(cancelled, point), context.Canceled)
 }
