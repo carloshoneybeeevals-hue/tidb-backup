@@ -345,6 +345,7 @@ func TestValidateLocationCoverage(t *testing.T) {
 			}
 		})
 	}
+	t.Run("RefreshRegionEpochsAfterSplit", testRefreshRegionEpochsAfterSplit)
 }
 
 // TestPanicInSplitKeyRangesByBuckets tests that panic recovery correctly logs the location index
@@ -539,7 +540,7 @@ func TestOverlappingRangesCanProduceOutOfOrderRangesAfterSplit(t *testing.T) {
 	require.Equal(t, lkr, result[0])
 }
 
-func TestRefreshRegionEpochsAfterSplit(t *testing.T) {
+func testRefreshRegionEpochsAfterSplit(t *testing.T) {
 	ctx := context.Background()
 	client, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
 	require.NoError(t, err)

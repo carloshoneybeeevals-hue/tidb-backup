@@ -588,7 +588,7 @@ func (v *PlanCacheRegionRefresher) RefreshRegionEpochs(ctx context.Context, rang
 // verifyRoute checks the cached ID with PD. On a mismatch, refill by key
 // and verify the installed owner once, since the refill can use a follower.
 func (v *PlanCacheRegionRefresher) verifyRoute(bo *tikv.Backoffer, loc *tikv.KeyLocation, key, end []byte) *tikv.KeyLocation {
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := range 2 {
 		current, err := v.cache.LocateRegionByIDFromPD(bo, loc.Region.GetID())
 		if err != nil {
 			return nil
