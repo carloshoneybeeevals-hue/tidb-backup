@@ -592,54 +592,90 @@ func BenchmarkPointGetClone(b *testing.B) {
 }
 
 func TestPreparedPlanCacheRefreshesSplitRegionBeforeExecution(t *testing.T) {
-	ctx := context.Background()
-	var cluster testutils.Cluster
-	store, dom := testkit.CreateMockStoreAndDomain(t, mockstore.WithClusterInspector(func(c testutils.Cluster) {
-		mockstore.BootstrapWithSingleStore(c)
-		cluster = c
-	}))
-	tk := testkit.NewTestKit(t, store)
-	tk.MustExec("use test")
-	tk.MustExec("set tidb_enable_prepared_plan_cache = 1")
-	tk.MustExec("create table t (id bigint primary key clustered)")
-	tk.MustExec("insert into t values (1), (100)")
-	tk.MustExec("prepare s from 'select id from t where id = ?'")
-	tk.MustExec("set @warm = 1, @hit = 100")
-	tk.MustQuery("execute s using @warm").Check(testkit.Rows("1"))
-	tk.MustQuery("select @@last_plan_from_cache").Check(testkit.Rows("0"))
+	for _, tc := range []struct {
+		name, predicate, args string
+		batch                 bool
+		warmRows, hitRows     [][]any
+	}{
+		{"PointGet", "id = ?", "", false, testkit.Rows("60"), testkit.Rows("100")},
+		{"BatchPointGet", "id in (?, ?, ?)", "@a, @b, ", true, testkit.Rows("1", "2", "60"), testkit.Rows("1", "100", "2")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			var cluster testutils.Cluster
+			store, dom := testkit.CreateMockStoreAndDomain(t, mockstore.WithClusterInspector(func(c testutils.Cluster) {
+				mockstore.BootstrapWithSingleStore(c)
+				cluster = c
+			}))
+			tk := testkit.NewTestKit(t, store)
+			tk.MustExec("use test")
+			tk.MustExec("set tidb_enable_prepared_plan_cache = 1")
+			tk.MustExec("create table t (id bigint primary key clustered)")
+			tbl, err := dom.InfoSchema().TableByName(ctx, ast.NewCIStr("test"), ast.NewCIStr("t"))
+			require.NoError(t, err)
+			id := tbl.Meta().ID
+			cache := store.(helper.Storage).GetRegionCache()
+			if tc.batch {
+				// Put the third handle in a different region from the table prefix.
+				boundary := tablecodec.EncodeRowKeyWithHandle(id, kv.IntHandle(50))
+				loc, err := cache.LocateKey(tikv.NewBackofferWithVars(ctx, 3000, nil), boundary)
+				require.NoError(t, err)
+				peer := cluster.AllocID()
+				cluster.SplitRaw(loc.Region.GetID(), cluster.AllocID(), store.GetCodec().EncodeKey(boundary), []uint64{peer}, peer)
+				cache.InvalidateCachedRegion(loc.Region)
+			}
+			tk.MustExec("insert into t values (1), (2), (60), (100)")
+			tk.MustExec("prepare s from 'select id from t where " + tc.predicate + "'")
+			tk.MustExec("set @a = 1, @b = 2, @warm = 60, @hit = 100")
+			tk.MustQuery("execute s using " + tc.args + "@warm").Sort().Check(tc.warmRows)
+			tk.MustQuery("select @@last_plan_from_cache").Check(testkit.Rows("0"))
 
-	tbl, err := dom.InfoSchema().TableByName(ctx, ast.NewCIStr("test"), ast.NewCIStr("t"))
-	require.NoError(t, err)
-	warmKey := tablecodec.EncodeRowKeyWithHandle(tbl.Meta().ID, kv.IntHandle(1))
-	hitKey := tablecodec.EncodeRowKeyWithHandle(tbl.Meta().ID, kv.IntHandle(100))
-	cache := store.(helper.Storage).GetRegionCache()
-	parent := cache.TryLocateKey(warmKey)
-	require.NotNil(t, parent)
-	require.True(t, parent.Contains(hitKey))
-	peer := cluster.AllocID()
-	right := cluster.SplitRaw(parent.Region.GetID(), cluster.AllocID(), store.GetCodec().EncodeKey(hitKey), []uint64{peer}, peer)
-	stale := cache.TryLocateKey(hitKey)
-	require.NotNil(t, stale)
-	require.Equal(t, parent.Region, stale.Region)
+			warmKey := tablecodec.EncodeRowKeyWithHandle(id, kv.IntHandle(60))
+			hitKey := tablecodec.EncodeRowKeyWithHandle(id, kv.IntHandle(100))
+			parent := cache.TryLocateKey(warmKey)
+			require.NotNil(t, parent)
+			require.True(t, parent.Contains(hitKey))
+			if tc.batch {
+				// A cache gap at the prefix stops a table-wide walk before the third handle.
+				prefix := tablecodec.GenTablePrefix(id)
+				loc := cache.TryLocateKey(prefix)
+				if loc != nil {
+					require.NotEqual(t, parent.Region, loc.Region)
+					cache.InvalidateCachedRegion(loc.Region)
+				}
+				require.Nil(t, cache.TryLocateKey(prefix))
+			}
+			peer := cluster.AllocID()
+			right := cluster.SplitRaw(parent.Region.GetID(), cluster.AllocID(), store.GetCodec().EncodeKey(hitKey), []uint64{peer}, peer)
+			stale := cache.TryLocateKey(hitKey)
+			require.NotNil(t, stale)
+			require.Equal(t, parent.Region, stale.Region)
 
-	// Compile EXECUTE through the normal planner, but hold execution until
-	// after inspecting the cache: no read or region-error retry can repair it.
-	stmt, err := parser.New().ParseOneStmt("execute s using @hit", "", "")
-	require.NoError(t, err)
-	require.NoError(t, tk.Session().PrepareTxnCtx(ctx, stmt))
-	compiler := executor.Compiler{Ctx: tk.Session()}
-	compiled, err := compiler.Compile(ctx, stmt)
-	require.NoError(t, err)
-	require.True(t, tk.Session().GetSessionVars().FoundInPlanCache)
-	route := cache.TryLocateKey(hitKey)
-	require.NotNil(t, route)
-	want := tikv.NewRegionVerID(right.Id, right.RegionEpoch.ConfVer, right.RegionEpoch.Version)
-	require.Equal(t, want, route.Region, "cache hit must route the rebound key to the split child before execution")
-	require.Equal(t, []byte(hitKey), route.StartKey)
+			// Compile EXECUTE through the normal planner, but hold execution until
+			// after inspecting the cache: no read or region-error retry can repair it.
+			hitSQL := "execute s using " + tc.args + "@hit"
+			stmt, err := parser.New().ParseOneStmt(hitSQL, "", "")
+			require.NoError(t, err)
+			require.NoError(t, tk.Session().PrepareTxnCtx(ctx, stmt))
+			compiler := executor.Compiler{Ctx: tk.Session()}
+			compiled, err := compiler.Compile(ctx, stmt)
+			require.NoError(t, err)
+			require.True(t, tk.Session().GetSessionVars().FoundInPlanCache)
+			if tc.batch {
+				require.IsType(t, &core.Execute{}, compiled.Plan)
+				require.IsType(t, &physicalop.BatchPointGetPlan{}, compiled.Plan.(*core.Execute).Plan)
+			}
+			route := cache.TryLocateKey(hitKey)
+			require.NotNil(t, route)
+			want := tikv.NewRegionVerID(right.Id, right.RegionEpoch.ConfVer, right.RegionEpoch.Version)
+			require.Equal(t, want, route.Region, "cache hit must route the rebound key to the split child before execution")
+			require.Equal(t, []byte(hitKey), route.StartKey)
 
-	rs, err := compiled.Exec(ctx)
-	require.NoError(t, err)
-	tk.ResultSetToResult(rs, "execute s using @hit").Check(testkit.Rows("100"))
+			rs, err := compiled.Exec(ctx)
+			require.NoError(t, err)
+			tk.ResultSetToResult(rs, hitSQL).Sort().Check(tc.hitRows)
+		})
+	}
 }
 
 type planCacheProbePD struct {

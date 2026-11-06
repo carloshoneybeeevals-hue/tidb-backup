@@ -388,6 +388,15 @@ func refreshCachedPlanRegions(ctx context.Context, sctx sessionctx.Context, plan
 				key := tablecodec.EncodeRowKeyWithHandle(id, p.Handle)
 				return cache.RefreshRegionEpochs(ctx, []kv.KeyRange{{StartKey: key, EndKey: key.Next()}})
 			}
+		case *physicalop.BatchPointGetPlan:
+			if p.TblInfo.ID == id && p.IndexInfo == nil {
+				ranges := make([]kv.KeyRange, len(p.Handles))
+				for i, handle := range p.Handles {
+					key := tablecodec.EncodeRowKeyWithHandle(id, handle)
+					ranges[i] = kv.KeyRange{StartKey: key, EndKey: key.Next()}
+				}
+				return cache.RefreshRegionEpochs(ctx, ranges)
+			}
 		case *physicalop.PhysicalIndexReader:
 			if scan, ok := p.IndexPlan.(*physicalop.PhysicalIndexScan); ok && scan.Table.ID == id {
 				encoded, err := distsql.IndexRangesToKVRanges(sctx.GetDistSQLCtx(), id, scan.Index.ID, scan.Ranges)
